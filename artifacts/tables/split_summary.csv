@@ -1,0 +1,8 @@
+metric,value
+train_rows,91200.0
+test_rows,22800.0
+train_track_ids,71799.0
+test_track_ids,17942.0
+train_hit_rate,0.814078947368421
+test_hit_rate,0.814078947368421
+train_test_track_overlap,0.0

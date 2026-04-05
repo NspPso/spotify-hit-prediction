@@ -1,0 +1,172 @@
+{
+  "dataset_summary": {
+    "rows": 114000,
+    "columns": 22,
+    "unique_track_ids": 89741,
+    "duplicate_track_rows": 24259,
+    "track_groups_with_conflicting_hit_labels": 20,
+    "genre_count": 114,
+    "missing_values_total": 3,
+    "missing_by_column": {
+      "artists": 1,
+      "album_name": 1,
+      "track_name": 1
+    },
+    "target_balance": {
+      "0": 21195,
+      "1": 92805
+    },
+    "target_rate": 0.814078947368421,
+    "popularity_summary": {
+      "count": 114000.0,
+      "mean": 33.2385350877193,
+      "std": 22.305078493372164,
+      "min": 0.0,
+      "25%": 17.0,
+      "50%": 35.0,
+      "75%": 50.0,
+      "max": 100.0
+    }
+  },
+  "split_summary": {
+    "train_rows": 91200,
+    "test_rows": 22800,
+    "train_track_ids": 71799,
+    "test_track_ids": 17942,
+    "train_hit_rate": 0.814078947368421,
+    "test_hit_rate": 0.814078947368421,
+    "train_test_track_overlap": 0
+  },
+  "cv_summary": [
+    {
+      "model": "random_forest",
+      "accuracy_mean": 0.8964363850392377,
+      "accuracy_std": 0.0010441627395141933,
+      "balanced_accuracy_mean": 0.8236028792194872,
+      "balanced_accuracy_std": 0.0022619084713200507,
+      "precision_mean": 0.9336533655605371,
+      "recall_mean": 0.9395506511023384,
+      "f1_mean": 0.9365924838213529,
+      "roc_auc_mean": 0.91006741344234,
+      "average_precision_mean": 0.9731386039908334,
+      "log_loss_mean": 0.33189240769155065,
+      "best_epoch_median": NaN
+    },
+    {
+      "model": "mlp",
+      "accuracy_mean": 0.8159100075157154,
+      "accuracy_std": 0.005903303566642276,
+      "balanced_accuracy_mean": 0.8225637968911732,
+      "balanced_accuracy_std": 0.0027162361823572616,
+      "precision_mean": 0.9551792008508938,
+      "recall_mean": 0.8119711889698907,
+      "f1_mean": 0.8777568841809374,
+      "roc_auc_mean": 0.9020770627777198,
+      "average_precision_mean": 0.9727472403492324,
+      "log_loss_mean": 0.3966004756204389,
+      "best_epoch_median": 23.0
+    },
+    {
+      "model": "xgboost",
+      "accuracy_mean": 0.8489474011343896,
+      "accuracy_std": 0.0016530063315329793,
+      "balanced_accuracy_mean": 0.8031274197003156,
+      "balanced_accuracy_std": 0.002078786577283921,
+      "precision_mean": 0.9342840228828626,
+      "recall_mean": 0.8760708337389186,
+      "f1_mean": 0.9042412430398145,
+      "roc_auc_mean": 0.8897952558820551,
+      "average_precision_mean": 0.9697895484289326,
+      "log_loss_mean": 0.43111777682585656,
+      "best_epoch_median": NaN
+    },
+    {
+      "model": "logistic_regression",
+      "accuracy_mean": 0.7897040045678869,
+      "accuracy_std": 0.005030679215124981,
+      "balanced_accuracy_mean": 0.7878559371829992,
+      "balanced_accuracy_std": 0.0033078185796785856,
+      "precision_mean": 0.9415148541523207,
+      "recall_mean": 0.790797979579492,
+      "f1_mean": 0.859591843563674,
+      "roc_auc_mean": 0.8695689418561442,
+      "average_precision_mean": 0.9640932785905711,
+      "log_loss_mean": 0.45260706736176065,
+      "best_epoch_median": NaN
+    },
+    {
+      "model": "decision_tree",
+      "accuracy_mean": 0.8511623195493366,
+      "accuracy_std": 0.0023712695451156367,
+      "balanced_accuracy_mean": 0.6334949658062907,
+      "balanced_accuracy_std": 0.003946635619833162,
+      "precision_mean": 0.8575135536704597,
+      "recall_mean": 0.9800118707491704,
+      "f1_mean": 0.9146792669807574,
+      "roc_auc_mean": 0.6342245262751057,
+      "average_precision_mean": 0.8571450186503441,
+      "log_loss_mean": 0.6071184955775161,
+      "best_epoch_median": NaN
+    }
+  ],
+  "test_summary": [
+    {
+      "model": "random_forest",
+      "accuracy": 0.8985964912280702,
+      "balanced_accuracy": 0.8375123009218127,
+      "precision": 0.9403284374830633,
+      "recall": 0.9347556704918916,
+      "f1": 0.9375337728304334,
+      "roc_auc": 0.9165759226042465,
+      "average_precision": 0.9751682620838203,
+      "log_loss": 0.321372146091231
+    },
+    {
+      "model": "mlp",
+      "accuracy": 0.8199561403508772,
+      "balanced_accuracy": 0.8272560135584002,
+      "precision": 0.9568322588800404,
+      "recall": 0.8156349334626367,
+      "f1": 0.8806096035831661,
+      "roc_auc": 0.9065771337113172,
+      "average_precision": 0.9742125105139179,
+      "log_loss": 0.38681327563310786
+    },
+    {
+      "model": "xgboost",
+      "accuracy": 0.8473684210526315,
+      "balanced_accuracy": 0.8075047052253215,
+      "precision": 0.9371050953567909,
+      "recall": 0.8709660039868542,
+      "f1": 0.9028258684239919,
+      "roc_auc": 0.89421701648266,
+      "average_precision": 0.9710605596054439,
+      "log_loss": 0.42967286249977327
+    },
+    {
+      "model": "logistic_regression",
+      "accuracy": 0.7880263157894737,
+      "balanced_accuracy": 0.7891691300920021,
+      "precision": 0.9428387096774193,
+      "recall": 0.7873498195140348,
+      "f1": 0.8581075129913978,
+      "roc_auc": 0.8731140000507627,
+      "average_precision": 0.9651332167585422,
+      "log_loss": 0.4520720784917835
+    },
+    {
+      "model": "decision_tree",
+      "accuracy": 0.852280701754386,
+      "balanced_accuracy": 0.6352285436825755,
+      "precision": 0.8580721187838793,
+      "recall": 0.9807661225149507,
+      "f1": 0.91532582461786,
+      "roc_auc": 0.6360339190813471,
+      "average_precision": 0.8577687588530792,
+      "log_loss": 0.6006177482287429
+    }
+  ],
+  "best_model": "random_forest",
+  "mlp_final_epochs": 23,
+  "artifacts_dir": "C:\\Users\\Malcolm\\OneDrive\\Documents\\New project\\spotify_hit_project\\artifacts"
+}
