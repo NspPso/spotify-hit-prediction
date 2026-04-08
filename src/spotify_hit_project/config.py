@@ -23,6 +23,8 @@ INNER_CV_SPLITS = 3
 TEST_FOLD_INDEX = 0
 MLP_MAX_EPOCHS = 35
 MLP_BATCH_SIZE = 512
+EMBEDDING_MLP_MAX_EPOCHS = 45
+EMBEDDING_MLP_BATCH_SIZE = 512
 
 DROP_COLUMNS = [
     "Unnamed: 0",
@@ -54,10 +56,24 @@ CATEGORICAL_FEATURES = [
     "track_genre",
 ]
 
-MODEL_NAMES = [
+BASE_MODEL_NAMES = [
     "logistic_regression",
     "decision_tree",
     "random_forest",
+    "extra_trees",
+    "hist_gradient_boosting",
     "xgboost",
     "mlp",
+    "embedding_mlp",
 ]
+
+ENSEMBLE_BLEND_MODELS = [
+    "random_forest",
+    "extra_trees",
+    "hist_gradient_boosting",
+    "xgboost",
+    "mlp",
+    "embedding_mlp",
+]
+
+MODEL_NAMES = BASE_MODEL_NAMES

@@ -12,8 +12,9 @@ import numpy as np
 import pandas as pd
 import torch
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import ExtraTreesClassifier, HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.impute import SimpleImputer
+from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     ConfusionMatrixDisplay,
@@ -22,6 +23,7 @@ from sklearn.metrics import (
     balanced_accuracy_score,
     confusion_matrix,
     f1_score,
+    brier_score_loss,
     log_loss,
     precision_recall_curve,
     precision_score,
@@ -40,6 +42,8 @@ from xgboost import XGBClassifier
 from .config import (
     ARTIFACTS_DIR,
     CATEGORICAL_FEATURES,
+    EMBEDDING_MLP_BATCH_SIZE,
+    EMBEDDING_MLP_MAX_EPOCHS,
     DATA_URL,
     DROP_COLUMNS,
     FIGURES_DIR,
@@ -49,6 +53,7 @@ from .config import (
     MLP_BATCH_SIZE,
     MLP_MAX_EPOCHS,
     MODEL_NAMES,
+    ENSEMBLE_BLEND_MODELS,
     NUMERIC_FEATURES,
     OUTER_SPLITS,
     POPULARITY_COLUMN,
@@ -67,6 +72,17 @@ class TrainedTorchModel:
     model: nn.Module
     device: str
     best_epoch: int
+    schema: EmbeddingSchema | None = None
+
+
+@dataclass
+class EmbeddingSchema:
+    numeric_columns: list[str]
+    numeric_mean: np.ndarray
+    numeric_std: np.ndarray
+    categorical_columns: list[str]
+    categorical_maps: dict[str, dict[str, int]]
+    embedding_dims: dict[str, int]
 
 
 def ensure_dirs() -> None:
@@ -254,8 +270,111 @@ def to_float32(array: Any) -> np.ndarray:
     return np.asarray(array, dtype=np.float32)
 
 
-def compute_metrics(y_true: np.ndarray, y_prob: np.ndarray) -> dict[str, float]:
-    y_pred = (y_prob >= 0.5).astype(int)
+def normalize_category(value: Any) -> str:
+    if pd.isna(value):
+        return "__missing__"
+    return str(value)
+
+
+def build_embedding_schema(train_df: pd.DataFrame) -> EmbeddingSchema:
+    numeric_frame = train_df[NUMERIC_FEATURES].astype(np.float32)
+    numeric_mean = numeric_frame.mean(axis=0, skipna=True).to_numpy(dtype=np.float32)
+    numeric_std = numeric_frame.std(axis=0, skipna=True, ddof=0).to_numpy(dtype=np.float32)
+    numeric_std = np.where(numeric_std < 1e-6, 1.0, numeric_std)
+
+    categorical_maps: dict[str, dict[str, int]] = {}
+    embedding_dims: dict[str, int] = {}
+    for column in CATEGORICAL_FEATURES:
+        values = train_df[column].map(normalize_category).astype(str)
+        categories = sorted(set(values.tolist()))
+        categorical_maps[column] = {category: index + 1 for index, category in enumerate(categories)}
+        cardinality = len(categorical_maps[column]) + 1
+        embedding_dims[column] = int(min(32, max(4, round((cardinality ** 0.5) * 2))))
+
+    return EmbeddingSchema(
+        numeric_columns=list(NUMERIC_FEATURES),
+        numeric_mean=numeric_mean,
+        numeric_std=numeric_std,
+        categorical_columns=list(CATEGORICAL_FEATURES),
+        categorical_maps=categorical_maps,
+        embedding_dims=embedding_dims,
+    )
+
+
+def encode_embedding_features(df: pd.DataFrame, schema: EmbeddingSchema) -> tuple[np.ndarray, np.ndarray]:
+    numeric_frame = df[schema.numeric_columns].astype(np.float32).to_numpy(copy=True)
+    numeric_frame = np.nan_to_num(numeric_frame, nan=0.0)
+    numeric_scaled = (numeric_frame - schema.numeric_mean) / schema.numeric_std
+
+    categorical_arrays: list[np.ndarray] = []
+    for column in schema.categorical_columns:
+        mapping = schema.categorical_maps[column]
+        series = df[column].map(normalize_category).astype(str)
+        encoded = series.map(mapping).fillna(0).astype(np.int64).to_numpy()
+        categorical_arrays.append(encoded)
+    categorical_matrix = np.stack(categorical_arrays, axis=1).astype(np.int64)
+    return numeric_scaled.astype(np.float32), categorical_matrix
+
+
+def make_embedding_loader(
+    df: pd.DataFrame,
+    y: np.ndarray,
+    schema: EmbeddingSchema,
+    batch_size: int,
+    shuffle: bool,
+) -> DataLoader:
+    numeric_array, categorical_array = encode_embedding_features(df, schema)
+    dataset = TensorDataset(
+        torch.tensor(numeric_array, dtype=torch.float32),
+        torch.tensor(categorical_array, dtype=torch.long),
+        torch.tensor(y, dtype=torch.float32),
+    )
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+
+
+class SpotifyEmbeddingMLP(nn.Module):
+    def __init__(
+        self,
+        schema: EmbeddingSchema,
+        hidden_dims: tuple[int, ...] = (256, 128, 64),
+        dropout: float = 0.20,
+    ) -> None:
+        super().__init__()
+        self.categorical_columns = schema.categorical_columns
+        self.embeddings = nn.ModuleDict(
+            {
+                column: nn.Embedding(len(schema.categorical_maps[column]) + 1, schema.embedding_dims[column])
+                for column in self.categorical_columns
+            }
+        )
+
+        input_dim = len(schema.numeric_columns) + sum(schema.embedding_dims[column] for column in self.categorical_columns)
+        layers: list[nn.Module] = []
+        prev_dim = input_dim
+        for hidden_dim in hidden_dims:
+            layers.extend(
+                [
+                    nn.Linear(prev_dim, hidden_dim),
+                    nn.BatchNorm1d(hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                ]
+            )
+            prev_dim = hidden_dim
+        layers.append(nn.Linear(prev_dim, 1))
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, numeric_x: torch.Tensor, categorical_x: torch.Tensor) -> torch.Tensor:
+        embedded_parts = [
+            self.embeddings[column](categorical_x[:, idx])
+            for idx, column in enumerate(self.categorical_columns)
+        ]
+        features = torch.cat([numeric_x, *embedded_parts], dim=1)
+        return self.network(features).squeeze(-1)
+
+
+def compute_metrics(y_true: np.ndarray, y_prob: np.ndarray, threshold: float = 0.5) -> dict[str, float]:
+    y_pred = (y_prob >= threshold).astype(int)
     return {
         "accuracy": float(accuracy_score(y_true, y_pred)),
         "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
@@ -265,6 +384,7 @@ def compute_metrics(y_true: np.ndarray, y_prob: np.ndarray) -> dict[str, float]:
         "roc_auc": float(roc_auc_score(y_true, y_prob)),
         "average_precision": float(average_precision_score(y_true, y_prob)),
         "log_loss": float(log_loss(y_true, y_prob, labels=[0, 1])),
+        "brier_score": float(brier_score_loss(y_true, y_prob)),
     }
 
 
@@ -297,6 +417,23 @@ def build_sklearn_model(model_name: str, y_train: np.ndarray) -> Any:
             min_samples_leaf=5,
             class_weight="balanced_subsample",
             n_jobs=-1,
+            random_state=RANDOM_STATE,
+        )
+    if model_name == "extra_trees":
+        return ExtraTreesClassifier(
+            n_estimators=400,
+            min_samples_leaf=4,
+            class_weight="balanced",
+            n_jobs=-1,
+            random_state=RANDOM_STATE,
+        )
+    if model_name == "hist_gradient_boosting":
+        return HistGradientBoostingClassifier(
+            max_depth=8,
+            learning_rate=0.05,
+            max_iter=250,
+            min_samples_leaf=25,
+            l2_regularization=0.1,
             random_state=RANDOM_STATE,
         )
     if model_name == "xgboost":
@@ -461,7 +598,276 @@ def predict_torch_probabilities(
     return np.concatenate(probabilities).astype(np.float64)
 
 
-def cross_validate_models(train_df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+def fit_embedding_mlp_with_early_stopping(
+    X_train_df: pd.DataFrame,
+    y_train: np.ndarray,
+    X_val_df: pd.DataFrame,
+    y_val: np.ndarray,
+    max_epochs: int = EMBEDDING_MLP_MAX_EPOCHS,
+    batch_size: int = EMBEDDING_MLP_BATCH_SIZE,
+    patience: int = 6,
+) -> TrainedTorchModel:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    schema = build_embedding_schema(X_train_df)
+    model = SpotifyEmbeddingMLP(schema=schema).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    loss_fn = nn.BCEWithLogitsLoss(
+        pos_weight=torch.tensor([negative_positive_ratio(y_train)], dtype=torch.float32, device=device)
+    )
+
+    train_loader = make_embedding_loader(X_train_df, y_train, schema=schema, batch_size=batch_size, shuffle=True)
+    val_numeric, val_categorical = encode_embedding_features(X_val_df, schema)
+    X_val_numeric = torch.tensor(val_numeric, dtype=torch.float32, device=device)
+    X_val_categorical = torch.tensor(val_categorical, dtype=torch.long, device=device)
+
+    best_score = -np.inf
+    best_epoch = 1
+    best_state = copy.deepcopy(model.state_dict())
+    stale_epochs = 0
+
+    for epoch in range(1, max_epochs + 1):
+        model.train()
+        for numeric_x, categorical_x, labels in train_loader:
+            numeric_x = numeric_x.to(device)
+            categorical_x = categorical_x.to(device)
+            labels = labels.to(device)
+            optimizer.zero_grad()
+            logits = model(numeric_x, categorical_x)
+            loss = loss_fn(logits, labels)
+            loss.backward()
+            optimizer.step()
+
+        model.eval()
+        with torch.no_grad():
+            val_logits = model(X_val_numeric, X_val_categorical)
+            val_probs = torch.sigmoid(val_logits).cpu().numpy()
+        score = average_precision_score(y_val, val_probs)
+
+        if score > best_score + 1e-5:
+            best_score = score
+            best_epoch = epoch
+            best_state = copy.deepcopy(model.state_dict())
+            stale_epochs = 0
+        else:
+            stale_epochs += 1
+
+        if stale_epochs >= patience:
+            break
+
+    model.load_state_dict(best_state)
+    return TrainedTorchModel(model=model, device=device, best_epoch=best_epoch, schema=schema)
+
+
+def fit_embedding_mlp_fixed_epochs(
+    X_train_df: pd.DataFrame,
+    y_train: np.ndarray,
+    epochs: int,
+    schema: EmbeddingSchema | None = None,
+    batch_size: int = EMBEDDING_MLP_BATCH_SIZE,
+) -> TrainedTorchModel:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    schema = schema or build_embedding_schema(X_train_df)
+    model = SpotifyEmbeddingMLP(schema=schema).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    loss_fn = nn.BCEWithLogitsLoss(
+        pos_weight=torch.tensor([negative_positive_ratio(y_train)], dtype=torch.float32, device=device)
+    )
+    train_loader = make_embedding_loader(X_train_df, y_train, schema=schema, batch_size=batch_size, shuffle=True)
+
+    for _ in range(max(1, epochs)):
+        model.train()
+        for numeric_x, categorical_x, labels in train_loader:
+            numeric_x = numeric_x.to(device)
+            categorical_x = categorical_x.to(device)
+            labels = labels.to(device)
+            optimizer.zero_grad()
+            logits = model(numeric_x, categorical_x)
+            loss = loss_fn(logits, labels)
+            loss.backward()
+            optimizer.step()
+
+    return TrainedTorchModel(model=model, device=device, best_epoch=max(1, epochs), schema=schema)
+
+
+def predict_embedding_probabilities(
+    trained_model: TrainedTorchModel,
+    X_df: pd.DataFrame,
+    batch_size: int = 2048,
+) -> np.ndarray:
+    if trained_model.schema is None:
+        raise ValueError("Embedding schema is required for embedding MLP prediction.")
+    model = trained_model.model
+    device = trained_model.device
+    model.eval()
+    numeric_array, categorical_array = encode_embedding_features(X_df, trained_model.schema)
+    dataset = TensorDataset(
+        torch.tensor(numeric_array, dtype=torch.float32),
+        torch.tensor(categorical_array, dtype=torch.long),
+    )
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    probabilities: list[np.ndarray] = []
+
+    with torch.no_grad():
+        for numeric_x, categorical_x in loader:
+            logits = model(numeric_x.to(device), categorical_x.to(device))
+            probabilities.append(torch.sigmoid(logits).cpu().numpy())
+    return np.concatenate(probabilities).astype(np.float64)
+
+
+def apply_probability_calibrator(calibrator: Any | None, probabilities: np.ndarray) -> np.ndarray:
+    if calibrator is None:
+        return np.asarray(probabilities, dtype=np.float64)
+
+    probs = np.asarray(probabilities, dtype=np.float64).reshape(-1)
+    if isinstance(calibrator, IsotonicRegression):
+        calibrated = calibrator.predict(np.clip(probs, 1e-6, 1 - 1e-6))
+        return np.asarray(calibrated, dtype=np.float64)
+
+    calibrated = calibrator.predict_proba(probs.reshape(-1, 1))[:, 1]
+    return np.asarray(calibrated, dtype=np.float64)
+
+
+def fit_probability_calibrator(
+    y_true: np.ndarray,
+    probabilities: np.ndarray,
+) -> tuple[Any | None, dict[str, Any]]:
+    y_true = np.asarray(y_true, dtype=np.int64)
+    probabilities = np.asarray(probabilities, dtype=np.float64)
+    if len(np.unique(y_true)) < 2:
+        return None, {"enabled": False, "reason": "Calibration requires both classes."}
+
+    unique_prob_count = int(np.unique(np.round(probabilities, 6)).shape[0])
+    if len(probabilities) >= 300 and unique_prob_count >= 25:
+        calibrator: Any = IsotonicRegression(out_of_bounds="clip")
+        calibrator.fit(probabilities, y_true)
+        method = "isotonic"
+    else:
+        calibrator = LogisticRegression(max_iter=1000, random_state=RANDOM_STATE)
+        calibrator.fit(probabilities.reshape(-1, 1), y_true)
+        method = "sigmoid"
+
+    calibrated = apply_probability_calibrator(calibrator, probabilities)
+    brier_before = float(brier_score_loss(y_true, probabilities))
+    brier_after = float(brier_score_loss(y_true, calibrated))
+    if brier_after >= brier_before:
+        return None, {
+            "enabled": False,
+            "reason": "Calibration did not improve Brier score.",
+            "candidate_method": method,
+            "oof_brier_before": brier_before,
+            "oof_brier_after": brier_after,
+            "oof_coverage": 1.0,
+        }
+
+    return calibrator, {
+        "enabled": True,
+        "method": method,
+        "oof_brier_before": brier_before,
+        "oof_brier_after": brier_after,
+        "oof_coverage": 1.0,
+    }
+
+
+def choose_threshold(
+    y_true: np.ndarray,
+    probabilities: np.ndarray,
+    metric: str = "balanced_accuracy",
+) -> dict[str, Any]:
+    y_true = np.asarray(y_true, dtype=np.int64)
+    probabilities = np.asarray(probabilities, dtype=np.float64)
+    thresholds = np.linspace(0.05, 0.95, 37)
+    best_threshold = 0.5
+    best_score = -np.inf
+
+    for threshold in thresholds:
+        predictions = (probabilities >= threshold).astype(int)
+        if metric == "f1":
+            score = float(f1_score(y_true, predictions, zero_division=0))
+        else:
+            score = float(balanced_accuracy_score(y_true, predictions))
+        if score > best_score or (np.isclose(score, best_score) and abs(threshold - 0.5) < abs(best_threshold - 0.5)):
+            best_score = score
+            best_threshold = float(threshold)
+
+    return {
+        "threshold": best_threshold,
+        "metric": metric,
+        "score": best_score,
+    }
+
+
+def soft_vote_probabilities(probability_map: dict[str, np.ndarray], weights: dict[str, float], model_names: list[str]) -> np.ndarray:
+    stacked = np.vstack([np.asarray(probability_map[name], dtype=np.float64) for name in model_names])
+    weight_array = np.asarray([weights.get(name, 0.0) for name in model_names], dtype=np.float64)
+    if float(weight_array.sum()) <= 0:
+        weight_array = np.ones(len(model_names), dtype=np.float64)
+    weight_array = weight_array / weight_array.sum()
+    return np.average(stacked, axis=0, weights=weight_array)
+
+
+def build_blend_weights(cv_summary: pd.DataFrame, model_names: list[str]) -> dict[str, float]:
+    summary_lookup = cv_summary.set_index("model")
+    raw_weights: dict[str, float] = {}
+    for name in model_names:
+        if name not in summary_lookup.index:
+            continue
+        score = float(summary_lookup.loc[name, "balanced_accuracy_mean"])
+        raw_weights[name] = max(score - 0.5, 0.0)
+    if not raw_weights or float(sum(raw_weights.values())) <= 0:
+        raw_weights = {name: 1.0 for name in model_names}
+    total = float(sum(raw_weights.values()))
+    return {name: value / total for name, value in raw_weights.items()}
+
+
+def fit_model_and_predict(
+    model_name: str,
+    X_fit_df: pd.DataFrame,
+    y_fit: np.ndarray,
+    X_eval_df: pd.DataFrame,
+    y_eval: np.ndarray | None = None,
+    *,
+    mlp_epochs: int | None = None,
+    embedding_epochs: int | None = None,
+) -> tuple[np.ndarray, float, EmbeddingSchema | None]:
+    if model_name == "mlp":
+        preprocessor = build_preprocessor()
+        X_fit = to_float32(preprocessor.fit_transform(X_fit_df))
+        X_eval = to_float32(preprocessor.transform(X_eval_df))
+        if y_eval is not None:
+            trained_model = fit_torch_mlp_with_early_stopping(X_fit, y_fit, X_eval, y_eval)
+        else:
+            trained_model = fit_torch_mlp_fixed_epochs(X_fit, y_fit, epochs=mlp_epochs or MLP_MAX_EPOCHS)
+        probabilities = predict_torch_probabilities(trained_model, X_eval)
+        return probabilities, float(trained_model.best_epoch), None
+
+    if model_name == "embedding_mlp":
+        if y_eval is not None:
+            trained_model = fit_embedding_mlp_with_early_stopping(
+                X_fit_df,
+                y_fit,
+                X_eval_df,
+                y_eval,
+                max_epochs=embedding_epochs or EMBEDDING_MLP_MAX_EPOCHS,
+            )
+        else:
+            trained_model = fit_embedding_mlp_fixed_epochs(
+                X_fit_df,
+                y_fit,
+                epochs=embedding_epochs or EMBEDDING_MLP_MAX_EPOCHS,
+            )
+        probabilities = predict_embedding_probabilities(trained_model, X_eval_df)
+        return probabilities, float(trained_model.best_epoch), trained_model.schema
+
+    preprocessor = build_preprocessor()
+    X_fit = to_float32(preprocessor.fit_transform(X_fit_df))
+    X_eval = to_float32(preprocessor.transform(X_eval_df))
+    model = build_sklearn_model(model_name, y_fit)
+    model.fit(X_fit, y_fit)
+    probabilities = predict_probabilities(model, X_eval)
+    return probabilities, np.nan, None
+
+
+def cross_validate_models(train_df: pd.DataFrame) -> tuple[pd.DataFrame, int, int, dict[str, np.ndarray]]:
     splitter = StratifiedGroupKFold(
         n_splits=INNER_CV_SPLITS,
         shuffle=True,
@@ -472,6 +878,10 @@ def cross_validate_models(train_df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     groups = train_df[GROUP_COLUMN].to_numpy()
     rows: list[dict[str, Any]] = []
     mlp_best_epochs: list[int] = []
+    embedding_best_epochs: list[int] = []
+    oof_probability_map: dict[str, np.ndarray] = {
+        model_name: np.full(len(train_df), np.nan, dtype=np.float64) for model_name in MODEL_NAMES
+    }
 
     for fold, (fit_idx, val_idx) in enumerate(splitter.split(X_df, y, groups=groups), start=1):
         X_fit_df = X_df.iloc[fit_idx]
@@ -479,22 +889,20 @@ def cross_validate_models(train_df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
         y_fit = y[fit_idx]
         y_val = y[val_idx]
 
-        preprocessor = build_preprocessor()
-        X_fit = to_float32(preprocessor.fit_transform(X_fit_df))
-        X_val = to_float32(preprocessor.transform(X_val_df))
-
         for model_name in MODEL_NAMES:
+            probabilities, best_epoch, _ = fit_model_and_predict(
+                model_name,
+                X_fit_df,
+                y_fit,
+                X_val_df,
+                y_val,
+            )
+            oof_probability_map[model_name][val_idx] = probabilities
+            extra = {"best_epoch": best_epoch}
             if model_name == "mlp":
-                trained_model = fit_torch_mlp_with_early_stopping(X_fit, y_fit, X_val, y_val)
-                probabilities = predict_torch_probabilities(trained_model, X_val)
-                extra = {"best_epoch": trained_model.best_epoch}
-                mlp_best_epochs.append(trained_model.best_epoch)
-            else:
-                model = build_sklearn_model(model_name, y_fit)
-                model.fit(X_fit, y_fit)
-                probabilities = predict_probabilities(model, X_val)
-                extra = {"best_epoch": np.nan}
-
+                mlp_best_epochs.append(int(best_epoch))
+            if model_name == "embedding_mlp":
+                embedding_best_epochs.append(int(best_epoch))
             metrics = compute_metrics(y_val, probabilities)
             rows.append({"model": model_name, "fold": fold, **metrics, **extra})
 
@@ -514,6 +922,7 @@ def cross_validate_models(train_df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
             roc_auc_mean=("roc_auc", "mean"),
             average_precision_mean=("average_precision", "mean"),
             log_loss_mean=("log_loss", "mean"),
+            brier_score_mean=("brier_score", "mean"),
             best_epoch_median=("best_epoch", "median"),
         )
         .sort_values(by=["balanced_accuracy_mean", "roc_auc_mean"], ascending=False)
@@ -523,37 +932,107 @@ def cross_validate_models(train_df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     mlp_epochs = 12
     if mlp_best_epochs:
         mlp_epochs = int(max(5, round(float(np.median(mlp_best_epochs)))))
-    return cv_summary, mlp_epochs
+    embedding_epochs = 12
+    if embedding_best_epochs:
+        embedding_epochs = int(max(5, round(float(np.median(embedding_best_epochs)))))
+    return cv_summary, mlp_epochs, embedding_epochs, oof_probability_map
 
 
 def fit_final_models(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
     mlp_epochs: int,
-) -> tuple[pd.DataFrame, dict[str, np.ndarray], str]:
+    embedding_epochs: int,
+    oof_probability_map: dict[str, np.ndarray],
+    cv_summary: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[str, np.ndarray], str, dict[str, Any]]:
     X_train_df = train_df[feature_columns()]
     y_train = train_df[TARGET_COLUMN].to_numpy()
     X_test_df = test_df[feature_columns()]
     y_test = test_df[TARGET_COLUMN].to_numpy()
 
-    preprocessor = build_preprocessor()
-    X_train = to_float32(preprocessor.fit_transform(X_train_df))
-    X_test = to_float32(preprocessor.transform(X_test_df))
-
     rows: list[dict[str, Any]] = []
     probability_map: dict[str, np.ndarray] = {}
+    calibrated_train_probability_map: dict[str, np.ndarray] = {}
+    calibrator_map: dict[str, Any | None] = {}
+    threshold_map: dict[str, dict[str, Any]] = {}
+    blend_weights = build_blend_weights(cv_summary, list(ENSEMBLE_BLEND_MODELS))
 
     for model_name in MODEL_NAMES:
-        if model_name == "mlp":
-            trained_model = fit_torch_mlp_fixed_epochs(X_train, y_train, epochs=mlp_epochs)
-            probabilities = predict_torch_probabilities(trained_model, X_test)
-        else:
-            model = build_sklearn_model(model_name, y_train)
-            model.fit(X_train, y_train)
-            probabilities = predict_probabilities(model, X_test)
+        probabilities, _, _ = fit_model_and_predict(
+            model_name,
+            X_train_df,
+            y_train,
+            X_test_df,
+            None,
+            mlp_epochs=mlp_epochs,
+            embedding_epochs=embedding_epochs,
+        )
+        calibrator, calibration_info = fit_probability_calibrator(y_train, oof_probability_map[model_name])
+        calibrated_train_probs = apply_probability_calibrator(calibrator, oof_probability_map[model_name])
+        calibrated_test_probs = apply_probability_calibrator(calibrator, probabilities)
+        threshold_info = choose_threshold(y_train, calibrated_train_probs, metric="balanced_accuracy")
+        decision_threshold = float(threshold_info["threshold"])
 
-        probability_map[model_name] = probabilities
-        rows.append({"model": model_name, **compute_metrics(y_test, probabilities)})
+        probability_map[model_name] = calibrated_test_probs
+        calibrated_train_probability_map[model_name] = calibrated_train_probs
+        calibrator_map[model_name] = calibrator
+        threshold_map[model_name] = {
+            **threshold_info,
+            "calibration_enabled": bool(calibration_info.get("enabled")),
+            "calibration_method": calibration_info.get("method", "none") if calibration_info.get("enabled") else "none",
+            "oof_brier_before": calibration_info.get("oof_brier_before"),
+            "oof_brier_after": calibration_info.get("oof_brier_after"),
+        }
+        rows.append(
+            {
+                "model": model_name,
+                **compute_metrics(y_test, calibrated_test_probs, threshold=decision_threshold),
+                "decision_threshold": decision_threshold,
+                "calibration_method": threshold_map[model_name]["calibration_method"],
+                "calibration_enabled": threshold_map[model_name]["calibration_enabled"],
+                "oof_brier_before": threshold_map[model_name]["oof_brier_before"],
+                "oof_brier_after": threshold_map[model_name]["oof_brier_after"],
+            }
+        )
+
+    ensemble_train_probs = soft_vote_probabilities(
+        calibrated_train_probability_map,
+        blend_weights,
+        list(ENSEMBLE_BLEND_MODELS),
+    )
+    ensemble_test_probs = soft_vote_probabilities(
+        probability_map,
+        blend_weights,
+        list(ENSEMBLE_BLEND_MODELS),
+    )
+    ensemble_calibrator, ensemble_calibration_info = fit_probability_calibrator(y_train, ensemble_train_probs)
+    ensemble_calibrated_train_probs = apply_probability_calibrator(ensemble_calibrator, ensemble_train_probs)
+    ensemble_calibrated_test_probs = apply_probability_calibrator(ensemble_calibrator, ensemble_test_probs)
+    ensemble_threshold_info = choose_threshold(y_train, ensemble_calibrated_train_probs, metric="balanced_accuracy")
+    ensemble_threshold = float(ensemble_threshold_info["threshold"])
+
+    probability_map["soft_vote_ensemble"] = ensemble_calibrated_test_probs
+    rows.append(
+        {
+            "model": "soft_vote_ensemble",
+            **compute_metrics(y_test, ensemble_calibrated_test_probs, threshold=ensemble_threshold),
+            "decision_threshold": ensemble_threshold,
+            "calibration_method": ensemble_calibration_info.get("method", "none") if ensemble_calibration_info.get("enabled") else "none",
+            "calibration_enabled": bool(ensemble_calibration_info.get("enabled")),
+            "oof_brier_before": ensemble_calibration_info.get("oof_brier_before"),
+            "oof_brier_after": ensemble_calibration_info.get("oof_brier_after"),
+        }
+    )
+    calibrated_train_probability_map["soft_vote_ensemble"] = ensemble_calibrated_train_probs
+    calibrator_map["soft_vote_ensemble"] = ensemble_calibrator
+    threshold_map["soft_vote_ensemble"] = {
+        **ensemble_threshold_info,
+        "calibration_enabled": bool(ensemble_calibration_info.get("enabled")),
+        "calibration_method": ensemble_calibration_info.get("method", "none") if ensemble_calibration_info.get("enabled") else "none",
+        "oof_brier_before": ensemble_calibration_info.get("oof_brier_before"),
+        "oof_brier_after": ensemble_calibration_info.get("oof_brier_after"),
+    }
 
     results_df = pd.DataFrame(rows).sort_values(
         by=["balanced_accuracy", "roc_auc"],
@@ -562,7 +1041,13 @@ def fit_final_models(
     results_df.to_csv(TABLES_DIR / "model_comparison.csv", index=False)
 
     best_model_name = str(results_df.iloc[0]["model"])
-    return results_df, probability_map, best_model_name
+    artifacts = {
+        "calibrators": calibrator_map,
+        "thresholds": threshold_map,
+        "calibrated_train_probability_map": calibrated_train_probability_map,
+        "blend_weights": blend_weights,
+    }
+    return results_df, probability_map, best_model_name, artifacts
 
 
 def save_model_comparison_plot(results_df: pd.DataFrame) -> None:
@@ -620,8 +1105,8 @@ def save_curve_plots(y_true: np.ndarray, probability_map: dict[str, np.ndarray])
     plt.close(fig)
 
 
-def save_confusion_outputs(y_true: np.ndarray, probabilities: np.ndarray, model_name: str) -> None:
-    predictions = (probabilities >= 0.5).astype(int)
+def save_confusion_outputs(y_true: np.ndarray, probabilities: np.ndarray, model_name: str, threshold: float) -> None:
+    predictions = (probabilities >= threshold).astype(int)
     cm = confusion_matrix(y_true, predictions, labels=[0, 1])
     pd.DataFrame(
         cm,
@@ -632,7 +1117,7 @@ def save_confusion_outputs(y_true: np.ndarray, probabilities: np.ndarray, model_
     fig, ax = plt.subplots(figsize=(5, 4))
     disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=[0, 1])
     disp.plot(ax=ax, colorbar=False, cmap="Blues")
-    ax.set_title(f"Best Model Confusion Matrix: {model_name}")
+    ax.set_title(f"Best Model Confusion Matrix: {model_name} @ {threshold:.2f}")
     fig.tight_layout()
     fig.savefig(FIGURES_DIR / "best_model_confusion_matrix.png", dpi=220)
     plt.close(fig)
@@ -652,6 +1137,7 @@ def save_workflow_summary(
     test_summary: pd.DataFrame,
     best_model_name: str,
     mlp_epochs: int,
+    embedding_epochs: int,
 ) -> None:
     best_row = test_summary.iloc[0]
     lines = [
@@ -695,7 +1181,8 @@ def save_workflow_summary(
             "- "
             f"{row['model']}: balanced_accuracy={row['balanced_accuracy_mean']:.3f}, "
             f"roc_auc={row['roc_auc_mean']:.3f}, "
-            f"f1={row['f1_mean']:.3f}"
+            f"f1={row['f1_mean']:.3f}, "
+            f"brier={row['brier_score_mean']:.3f}"
         )
 
     lines.extend(["", "## Test Set Results"])
@@ -717,7 +1204,11 @@ def save_workflow_summary(
             f"- ROC-AUC: {best_row['roc_auc']:.3f}",
             f"- Average precision: {best_row['average_precision']:.3f}",
             f"- F1: {best_row['f1']:.3f}",
+            f"- Brier score: {best_row['brier_score']:.3f}",
+            f"- Decision threshold: {best_row['decision_threshold']:.3f}",
+            f"- Calibration method: {best_row['calibration_method']}",
             f"- Final MLP epochs selected from CV: {mlp_epochs}",
+            f"- Final embedding MLP epochs selected from CV: {embedding_epochs}",
         ]
     )
 
@@ -735,8 +1226,16 @@ def run_pipeline() -> dict[str, Any]:
     train_df, test_df = make_outer_split(df)
     split_summary = save_split_summary(train_df, test_df)
 
-    cv_summary, mlp_epochs = cross_validate_models(train_df)
-    test_summary, probability_map, best_model_name = fit_final_models(train_df, test_df, mlp_epochs)
+    cv_summary, mlp_epochs, embedding_epochs, oof_probability_map = cross_validate_models(train_df)
+    test_summary, probability_map, best_model_name, artifacts = fit_final_models(
+        train_df,
+        test_df,
+        mlp_epochs,
+        embedding_epochs,
+        oof_probability_map,
+        cv_summary,
+    )
+    best_row = test_summary.iloc[0]
 
     save_model_comparison_plot(test_summary)
     save_curve_plots(test_df[TARGET_COLUMN].to_numpy(), probability_map)
@@ -744,6 +1243,7 @@ def run_pipeline() -> dict[str, Any]:
         test_df[TARGET_COLUMN].to_numpy(),
         probability_map[best_model_name],
         best_model_name,
+        float(best_row["decision_threshold"]),
     )
 
     context = {
@@ -753,6 +1253,11 @@ def run_pipeline() -> dict[str, Any]:
         "test_summary": test_summary.to_dict("records"),
         "best_model": best_model_name,
         "mlp_final_epochs": mlp_epochs,
+        "embedding_mlp_final_epochs": embedding_epochs,
+        "ensemble_blend_models": list(ENSEMBLE_BLEND_MODELS),
+        "best_decision_threshold": float(best_row["decision_threshold"]),
+        "best_calibration_method": best_row["calibration_method"],
+        "ensemble_weights": artifacts["blend_weights"],
         "artifacts_dir": str(ARTIFACTS_DIR),
     }
     save_report_context(context)
@@ -763,5 +1268,6 @@ def run_pipeline() -> dict[str, Any]:
         test_summary=test_summary,
         best_model_name=best_model_name,
         mlp_epochs=mlp_epochs,
+        embedding_epochs=embedding_epochs,
     )
     return context
